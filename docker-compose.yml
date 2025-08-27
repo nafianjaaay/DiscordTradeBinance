@@ -1,0 +1,67 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  trading-bot:
+    build: .
+    container_name: trading-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./bot_state.db:/app/bot_state.db
+    networks:
+      - bot-network
+
+  dashboard:
+    build: .
+    container_name: trading-dashboard
+    command: python dashboard.py
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs:ro
+      - ./bot_state.db:/app/bot_state.db:ro
+    depends_on:
+      - trading-bot
+    networks:
+      - bot-network
+
+  monitor:
+    build: .
+    container_name: trading-monitor
+    command: python monitor.py
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs:ro
+    depends_on:
+      - trading-bot
+    networks:
+      - bot-network
+
+networks:
+  bot-network:
+    driver: bridge
+
+---
+
+# .dockerignore
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+.env.local
+.git
+.gitignore
+.vscode
+.idea
+*.log
+logs/*
+!logs/.gitkeep

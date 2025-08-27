@@ -1,0 +1,36 @@
+[Unit]
+Description=Discord to Binance Trading Bot
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/home/YOUR_USERNAME/trading-bot
+Environment="PATH=/usr/bin:/usr/local/bin"
+ExecStart=/usr/bin/python3 /home/YOUR_USERNAME/trading-bot/main.py
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=append:/home/YOUR_USERNAME/trading-bot/logs/system.log
+StandardError=append:/home/YOUR_USERNAME/trading-bot/logs/error.log
+
+# Security
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/home/YOUR_USERNAME/trading-bot/logs
+
+[Install]
+WantedBy=multi-user.target
+
+# Installation Instructions:
+# 1. Update YOUR_USERNAME with your actual username
+# 2. Update paths if bot is installed elsewhere
+# 3. Copy to: sudo cp trading-bot.service /etc/systemd/system/
+# 4. Reload: sudo systemctl daemon-reload
+# 5. Enable: sudo systemctl enable trading-bot
+# 6. Start: sudo systemctl start trading-bot
+# 7. Status: sudo systemctl status trading-bot
+# 8. Logs: journalctl -u trading-bot -f

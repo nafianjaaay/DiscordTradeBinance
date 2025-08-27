@@ -1,0 +1,17 @@
+# Discord to Binance Trading Bot Dependencies
+
+# Discord
+discord.py>=2.3.0
+
+# Binance
+binance-connector>=3.5.0
+
+# Environment and Config
+python-dotenv>=1.0.0
+
+# Utilities
+aiohttp>=3.9.0
+requests>=2.31.0
+
+# Optional: For enhanced performance
+uvloop>=0.19.0  # Linux/Mac only

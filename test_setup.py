@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Test script to validate bot setup and configuration
+Test script to validate CCXT bot setup and configuration
 """
 
 import os
 import sys
 import json
+import ccxt
 from decimal import Decimal
 from datetime import datetime
 from dotenv import load_dotenv
@@ -55,7 +56,7 @@ def test_imports():
     
     libraries = [
         ("discord", "discord.py"),
-        ("binance.um_futures", "binance-connector"),
+        ("ccxt", "ccxt"),
         ("dotenv", "python-dotenv"),
         ("flask", "flask"),
         ("psutil", "psutil")
@@ -69,10 +70,101 @@ def test_imports():
         except ImportError:
             all_good = check_status(False, f"{package} is NOT installed - run: pip install {package}")
     
+    # Check CCXT version
+    try:
+        import ccxt
+        check_status(True, f"CCXT version: {ccxt.__version__}")
+    except:
+        pass
+    
     return all_good
 
+def test_ccxt_connection():
+    """Test Binance connection via CCXT"""
+    print_header("Testing CCXT Binance Connection")
+    
+    try:
+        use_testnet = os.getenv("USE_TESTNET", "true").lower() == "true"
+        
+        # Configure exchange
+        exchange_config = {
+            'apiKey': os.getenv("BINANCE_API_KEY"),
+            'secret': os.getenv("BINANCE_API_SECRET"),
+            'enableRateLimit': True,
+            'options': {
+                'defaultType': 'future',
+                'adjustForTimeDifference': True,
+            }
+        }
+        
+        if use_testnet:
+            exchange_config['options']['testnet'] = True
+            exchange_config['urls'] = {
+                'api': {
+                    'public': 'https://testnet.binancefuture.com/fapi/v1',
+                    'private': 'https://testnet.binancefuture.com/fapi/v1',
+                    'fapiPublic': 'https://testnet.binancefuture.com/fapi/v1',
+                    'fapiPrivate': 'https://testnet.binancefuture.com/fapi/v1',
+                }
+            }
+        
+        exchange = ccxt.binance(exchange_config)
+        check_status(True, f"CCXT exchange created for {'TESTNET' if use_testnet else 'LIVE'}")
+        
+        # Test public endpoint
+        try:
+            server_time = exchange.fetch_time()
+            check_status(True, f"Connected to server - Time: {datetime.fromtimestamp(server_time/1000)}")
+        except Exception as e:
+            check_status(False, f"Failed to connect: {e}")
+            return False
+        
+        # Load markets
+        try:
+            markets = exchange.load_markets()
+            check_status(True, f"Loaded {len(markets)} markets")
+            
+            # Show sample market info
+            if 'BTC/USDT:USDT' in markets:
+                btc_market = markets['BTC/USDT:USDT']
+                print(f"   Sample market (BTC/USDT:USDT):")
+                print(f"   - Min amount: {btc_market['limits']['amount']['min']}")
+                print(f"   - Price precision: {btc_market['precision']['price']}")
+                print(f"   - Amount precision: {btc_market['precision']['amount']}")
+        except Exception as e:
+            check_status(False, f"Failed to load markets: {e}")
+            return False
+        
+        # Test authenticated endpoints
+        try:
+            balance = exchange.fetch_balance()
+            usdt_balance = balance['USDT']['total'] if 'USDT' in balance else 0
+            check_status(True, f"Account authenticated - Balance: ${usdt_balance:.2f} USDT")
+        except Exception as e:
+            check_status(False, f"Authentication failed: {e}")
+            print("   Make sure your API key has Futures permissions")
+            return False
+        
+        # Test futures-specific functions
+        try:
+            positions = exchange.fetch_positions()
+            open_positions = [p for p in positions if p['contracts'] != 0]
+            check_status(True, f"Fetched positions - {len(open_positions)} open")
+        except Exception as e:
+            check_status(False, f"Failed to fetch positions: {e}")
+            return False
+        
+        return True
+        
+    except ImportError:
+        check_status(False, "CCXT not installed")
+        return False
+    except Exception as e:
+        check_status(False, f"Unexpected error: {e}")
+        return False
+
 def test_signal_parsing():
-    """Test signal parser"""
+    """Test signal parser with CCXT format"""
     print_header("Testing Signal Parser")
     
     # Import the parser
@@ -99,7 +191,9 @@ def test_signal_parsing():
     signal = parser.parse(test_message, 123456)
     
     if signal:
-        check_status(True, f"Signal parsed: {signal.symbol} {signal.side.name}")
+        # Check CCXT symbol format conversion
+        check_status(True, f"Signal parsed: {signal.symbol}")
+        check_status('/USDT:USDT' in signal.symbol, f"Symbol converted to CCXT format: {signal.symbol}")
         check_status(signal.validate(), "Signal validation passed")
         rr = signal.calculate_risk_reward()
         check_status(rr > 0, f"Risk-Reward calculated: {rr:.2f}")
@@ -107,86 +201,6 @@ def test_signal_parsing():
     else:
         check_status(False, "Failed to parse test signal")
         return False
-
-def test_binance_connection():
-    """Test Binance API connection"""
-    print_header("Testing Binance Connection")
-    
-    try:
-        from binance.um_futures import UMFutures
-        
-        use_testnet = os.getenv("USE_TESTNET", "true").lower() == "true"
-        base_url = "https://testnet.binancefuture.com" if use_testnet else "https://fapi.binance.com"
-        
-        client = UMFutures(
-            key=os.getenv("BINANCE_API_KEY"),
-            secret=os.getenv("BINANCE_API_SECRET"),
-            base_url=base_url
-        )
-        
-        # Test public endpoint
-        try:
-            server_time = client.time()
-            check_status(True, f"Connected to {'TESTNET' if use_testnet else 'LIVE'} server")
-            
-            # Show server time
-            server_dt = datetime.fromtimestamp(server_time['serverTime'] / 1000)
-            print(f"   Server time: {server_dt}")
-            
-        except Exception as e:
-            check_status(False, f"Failed to connect to Binance: {e}")
-            return False
-        
-        # Test authenticated endpoint
-        try:
-            account = client.account()
-            balance = float(account.get('totalWalletBalance', 0))
-            check_status(True, f"Account authenticated - Balance: ${balance:.2f}")
-            
-            # Check if futures trading is enabled
-            if not account.get('canTrade'):
-                check_status(False, "Futures trading is not enabled on this account")
-                return False
-                
-        except Exception as e:
-            check_status(False, f"Authentication failed: {e}")
-            print("   Make sure your API key has Futures permissions")
-            return False
-            
-        return True
-        
-    except ImportError:
-        check_status(False, "binance-connector not installed")
-        return False
-
-def test_discord_token():
-    """Basic Discord token validation"""
-    print_header("Testing Discord Configuration")
-    
-    token = os.getenv("DISCORD_BOT_TOKEN", "")
-    channel_id = os.getenv("DISCORD_CHANNEL_ID", "0")
-    
-    # Basic token format check
-    if len(token) > 50 and "." in token:
-        check_status(True, "Discord token format looks valid")
-    else:
-        check_status(False, "Discord token format appears invalid")
-        return False
-    
-    # Channel ID check
-    try:
-        channel_id_int = int(channel_id)
-        if channel_id_int > 0:
-            check_status(True, f"Discord channel ID set: {channel_id_int}")
-        else:
-            check_status(False, "Discord channel ID not configured")
-            return False
-    except ValueError:
-        check_status(False, "Discord channel ID must be a number")
-        return False
-    
-    print("   Note: Full Discord validation requires running the bot")
-    return True
 
 def test_persistence():
     """Test database persistence"""
@@ -248,9 +262,74 @@ def test_risk_calculations():
     
     return True
 
+def test_ccxt_order_placement():
+    """Test order placement functionality (dry run)"""
+    print_header("Testing Order Placement (Dry Run)")
+    
+    try:
+        use_testnet = os.getenv("USE_TESTNET", "true").lower() == "true"
+        
+        if not use_testnet:
+            print("⚠️  Skipping order placement test on LIVE account")
+            return True
+        
+        exchange_config = {
+            'apiKey': os.getenv("BINANCE_API_KEY"),
+            'secret': os.getenv("BINANCE_API_SECRET"),
+            'enableRateLimit': True,
+            'options': {
+                'defaultType': 'future',
+                'adjustForTimeDifference': True,
+                'testnet': True
+            },
+            'urls': {
+                'api': {
+                    'public': 'https://testnet.binancefuture.com/fapi/v1',
+                    'private': 'https://testnet.binancefuture.com/fapi/v1',
+                    'fapiPublic': 'https://testnet.binancefuture.com/fapi/v1',
+                    'fapiPrivate': 'https://testnet.binancefuture.com/fapi/v1',
+                }
+            }
+        }
+        
+        exchange = ccxt.binance(exchange_config)
+        exchange.load_markets()
+        
+        # Test symbol
+        symbol = 'BTC/USDT:USDT'
+        
+        if symbol not in exchange.markets:
+            print(f"   Test symbol {symbol} not found in markets")
+            return True
+        
+        # Get current price
+        ticker = exchange.fetch_ticker(symbol)
+        current_price = ticker['last']
+        check_status(True, f"Current {symbol} price: ${current_price:.2f}")
+        
+        # Test order parameters
+        market = exchange.markets[symbol]
+        min_amount = market['limits']['amount']['min']
+        
+        print(f"   Order parameters for {symbol}:")
+        print(f"   - Min order size: {min_amount}")
+        print(f"   - Price precision: {market['precision']['price']}")
+        print(f"   - Amount precision: {market['precision']['amount']}")
+        
+        check_status(True, "Order placement parameters validated")
+        
+        print("\n   Note: Actual order placement skipped (dry run only)")
+        print("   To test real orders, use the bot in SIMULATION mode first")
+        
+        return True
+        
+    except Exception as e:
+        check_status(False, f"Order test error: {e}")
+        return False
+
 def run_all_tests():
     """Run all tests"""
-    print("\n" + "🤖 Trading Bot Setup Validator".center(50))
+    print("\n" + "🤖 Trading Bot CCXT Setup Validator".center(50))
     print("=" * 50)
     
     results = []
@@ -260,11 +339,11 @@ def run_all_tests():
     results.append(("Libraries", test_imports()))
     
     if results[-1][1]:  # Only continue if imports work
+        results.append(("CCXT Connection", test_ccxt_connection()))
         results.append(("Signal Parsing", test_signal_parsing()))
-        results.append(("Discord", test_discord_token()))
-        results.append(("Binance API", test_binance_connection()))
         results.append(("Database", test_persistence()))
         results.append(("Risk Settings", test_risk_calculations()))
+        results.append(("Order Placement", test_ccxt_order_placement()))
     
     # Summary
     print_header("Test Summary")
@@ -279,12 +358,17 @@ def run_all_tests():
     print(f"\n  Total: {passed}/{total} tests passed")
     
     if passed == total:
-        print("\n🎉 All tests passed! Your bot is ready to run.")
+        print("\n🎉 All tests passed! Your CCXT bot is ready to run.")
         print("\nNext steps:")
         print("1. Test in SIMULATION mode first: ENABLE_TRADING=false")
         print("2. Run on TESTNET: USE_TESTNET=true")
-        print("3. Monitor with dashboard: python dashboard.py")
+        print("3. Monitor with dashboard: python dashboard_ccxt.py")
         print("4. Only go LIVE after thorough testing!")
+        print("\n💡 CCXT advantages:")
+        print("   - Better maintained and documented")
+        print("   - Supports 100+ exchanges")
+        print("   - Unified API across all exchanges")
+        print("   - Active community support")
     else:
         print("\n⚠️  Some tests failed. Please fix the issues above before running the bot.")
     

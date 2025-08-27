@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Web Dashboard for Discord-Binance Trading Bot
+Web Dashboard for Discord-Binance Trading Bot (CCXT Version)
 Provides real-time monitoring via a simple web interface
 """
 
@@ -13,8 +13,8 @@ from flask import Flask, render_template_string, jsonify, request
 from flask_cors import CORS
 import threading
 import time
+import ccxt
 
-from binance.um_futures import UMFutures
 from dotenv import load_dotenv
 
 # Load configuration
@@ -30,20 +30,49 @@ USE_TESTNET = os.getenv("USE_TESTNET", "true").lower() == "true"
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET")
 
-# Initialize Binance client
-base_url = "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com"
-binance_client = UMFutures(
-    key=BINANCE_API_KEY,
-    secret=BINANCE_API_SECRET,
-    base_url=base_url
-) if BINANCE_API_KEY else None
+# Initialize CCXT exchange
+def init_exchange():
+    """Initialize CCXT exchange connection"""
+    if not BINANCE_API_KEY:
+        return None
+    
+    exchange_config = {
+        'apiKey': BINANCE_API_KEY,
+        'secret': BINANCE_API_SECRET,
+        'enableRateLimit': True,
+        'options': {
+            'defaultType': 'future',
+            'adjustForTimeDifference': True,
+        }
+    }
+    
+    if USE_TESTNET:
+        exchange_config['options']['testnet'] = True
+        exchange_config['urls'] = {
+            'api': {
+                'public': 'https://testnet.binancefuture.com/fapi/v1',
+                'private': 'https://testnet.binancefuture.com/fapi/v1',
+                'fapiPublic': 'https://testnet.binancefuture.com/fapi/v1',
+                'fapiPrivate': 'https://testnet.binancefuture.com/fapi/v1',
+            }
+        }
+    
+    try:
+        exchange = ccxt.binance(exchange_config)
+        exchange.load_markets()
+        return exchange
+    except Exception as e:
+        print(f"Failed to initialize exchange: {e}")
+        return None
+
+exchange = init_exchange()
 
 # HTML Template
 DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Trading Bot Dashboard</title>
+    <title>Trading Bot Dashboard (CCXT)</title>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
@@ -64,6 +93,13 @@ DASHBOARD_HTML = """
             text-align: center;
             margin-bottom: 30px;
             text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+        }
+        .subtitle {
+            color: rgba(255,255,255,0.9);
+            text-align: center;
+            margin-top: -20px;
+            margin-bottom: 30px;
+            font-size: 0.9em;
         }
         .grid {
             display: grid;
@@ -184,10 +220,13 @@ DASHBOARD_HTML = """
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
-        .chart {
-            height: 200px;
-            margin-top: 15px;
-            position: relative;
+        .ccxt-badge {
+            background: #4CAF50;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-size: 0.8em;
+            margin-left: 10px;
         }
         @media (max-width: 768px) {
             .grid { grid-template-columns: 1fr; }
@@ -196,7 +235,8 @@ DASHBOARD_HTML = """
 </head>
 <body>
     <div class="container">
-        <h1>🤖 Trading Bot Dashboard</h1>
+        <h1>🤖 Trading Bot Dashboard <span class="ccxt-badge">CCXT</span></h1>
+        <div class="subtitle">Powered by CCXT - Universal Exchange Library</div>
         
         <div class="grid">
             <!-- Status Card -->
@@ -293,6 +333,10 @@ DASHBOARD_HTML = """
                     <span class="value">${data.testnet ? 'TESTNET' : 'LIVE'}</span>
                 </div>
                 <div class="stat">
+                    <span class="label">Exchange Library</span>
+                    <span class="value">CCXT v${data.ccxt_version || 'N/A'}</span>
+                </div>
+                <div class="stat">
                     <span class="label">Last Update</span>
                     <span class="value">${new Date().toLocaleTimeString()}</span>
                 </div>
@@ -333,8 +377,8 @@ DASHBOARD_HTML = """
                     <span class="value">${data.signals_today}</span>
                 </div>
                 <div class="stat">
-                    <span class="label">Success Rate</span>
-                    <span class="value green">${data.success_rate}%</span>
+                    <span class="label">Markets Loaded</span>
+                    <span class="value">${data.markets_loaded}</span>
                 </div>
                 <div class="stat">
                     <span class="label">Avg Risk/Reward</span>
@@ -376,10 +420,8 @@ DASHBOARD_HTML = """
                             <span style="font-size: 0.85em; color: #999;">${sig.time_ago}</span>
                         </div>
                         <div class="position-details">
-                            <span>Entries: <strong>${sig.entries}</strong></span>
-                            <span>SL: <strong>$${sig.stop_loss}</strong></span>
-                            <span>RR: <strong>${sig.risk_reward}</strong></span>
                             <span>Status: <strong>${sig.status}</strong></span>
+                            <span>RR: <strong>${sig.risk_reward || 'N/A'}</strong></span>
                         </div>
                     </div>
                 `).join('');
@@ -434,8 +476,8 @@ def get_bot_status():
     return False
 
 def get_account_info():
-    """Get account information from Binance"""
-    if not binance_client:
+    """Get account information from Binance via CCXT"""
+    if not exchange:
         return {
             'balance': 0,
             'unrealized_pnl': 0,
@@ -444,12 +486,22 @@ def get_account_info():
         }
     
     try:
-        account = binance_client.account()
+        balance_data = exchange.fetch_balance()
+        positions = exchange.fetch_positions()
+        
+        # Calculate total PNL from positions
+        total_pnl = sum(pos['unrealizedPnl'] for pos in positions if pos['unrealizedPnl'])
+        
+        # Get USDT balance
+        usdt_balance = balance_data['USDT']['total'] if 'USDT' in balance_data else 0
+        usdt_free = balance_data['USDT']['free'] if 'USDT' in balance_data else 0
+        usdt_used = balance_data['USDT']['used'] if 'USDT' in balance_data else 0
+        
         return {
-            'balance': float(account['totalWalletBalance']),
-            'unrealized_pnl': float(account['unrealizedProfit']),
-            'margin_used': float(account['totalInitialMargin']),
-            'free_margin': float(account['availableBalance'])
+            'balance': usdt_balance,
+            'unrealized_pnl': total_pnl,
+            'margin_used': usdt_used,
+            'free_margin': usdt_free
         }
     except Exception as e:
         print(f"Error getting account info: {e}")
@@ -461,24 +513,29 @@ def get_account_info():
         }
 
 def get_positions():
-    """Get open positions"""
-    if not binance_client:
+    """Get open positions via CCXT"""
+    if not exchange:
         return []
     
     try:
-        account = binance_client.account()
-        positions = []
-        for pos in account['positions']:
-            if float(pos['positionAmt']) != 0:
-                positions.append({
-                    'symbol': pos['symbol'],
-                    'side': 'LONG' if float(pos['positionAmt']) > 0 else 'SHORT',
-                    'size': abs(float(pos['positionAmt'])),
-                    'entry': float(pos['entryPrice']),
-                    'mark': float(pos['markPrice']),
-                    'pnl': float(pos['unrealizedProfit'])
+        positions = exchange.fetch_positions()
+        formatted_positions = []
+        
+        for pos in positions:
+            if pos['contracts'] != 0:
+                # Format symbol for display
+                display_symbol = pos['symbol'].replace(':USDT', '').replace('/', '')
+                
+                formatted_positions.append({
+                    'symbol': display_symbol,
+                    'side': 'LONG' if pos['contracts'] > 0 else 'SHORT',
+                    'size': abs(pos['contracts']),
+                    'entry': pos['markPrice'] if pos['markPrice'] else 0,
+                    'mark': pos['markPrice'] if pos['markPrice'] else 0,
+                    'pnl': pos['unrealizedPnl'] if pos['unrealizedPnl'] else 0
                 })
-        return positions
+        
+        return formatted_positions
     except Exception as e:
         print(f"Error getting positions: {e}")
         return []
@@ -511,9 +568,6 @@ def get_recent_signals():
                     'symbol': row[0],
                     'side': row[1],
                     'time_ago': time_ago,
-                    'entries': 'N/A',
-                    'stop_loss': 'N/A',
-                    'risk_reward': 'N/A',
                     'status': 'PROCESSED'
                 })
     except Exception as e:
@@ -555,10 +609,13 @@ def calculate_statistics():
             row = cursor.fetchone()
             open_positions = json.loads(row[0]) if row else 0
             
+            # Count markets loaded
+            markets_loaded = len(exchange.markets) if exchange else 0
+            
             return {
                 'signals_today': signals_today,
                 'open_positions': open_positions,
-                'success_rate': 75,  # Placeholder - implement actual calculation
+                'markets_loaded': markets_loaded,
                 'avg_rr': 2.5  # Placeholder - implement actual calculation
             }
     except Exception as e:
@@ -566,7 +623,7 @@ def calculate_statistics():
         return {
             'signals_today': 0,
             'open_positions': 0,
-            'success_rate': 0,
+            'markets_loaded': 0,
             'avg_rr': 0
         }
 
@@ -581,10 +638,18 @@ def api_data():
     account = get_account_info()
     stats = calculate_statistics()
     
+    # Get CCXT version
+    try:
+        import ccxt
+        ccxt_version = ccxt.__version__
+    except:
+        ccxt_version = "Unknown"
+    
     data = {
         'bot_running': get_bot_status(),
         'trading_mode': 'LIVE' if os.getenv('ENABLE_TRADING', 'false').lower() == 'true' else 'SIMULATION',
         'testnet': USE_TESTNET,
+        'ccxt_version': ccxt_version,
         'balance': account['balance'],
         'unrealized_pnl': account['unrealized_pnl'],
         'margin_used': account['margin_used'],
@@ -594,7 +659,7 @@ def api_data():
         'recent_logs': get_recent_logs(),
         'signals_today': stats['signals_today'],
         'open_positions': stats['open_positions'],
-        'success_rate': stats['success_rate'],
+        'markets_loaded': stats['markets_loaded'],
         'avg_rr': stats['avg_rr']
     }
     
@@ -603,6 +668,8 @@ def api_data():
 def run_dashboard(host='0.0.0.0', port=5000, debug=False):
     """Run the dashboard server"""
     print(f"Starting dashboard on http://{host}:{port}")
+    print(f"Using CCXT version: {ccxt.__version__ if 'ccxt' in globals() else 'Not installed'}")
+    print(f"Exchange: {'Connected' if exchange else 'Not connected'}")
     app.run(host=host, port=port, debug=debug)
 
 if __name__ == '__main__':

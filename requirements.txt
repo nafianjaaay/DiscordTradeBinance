@@ -1,17 +1,23 @@
-# Discord to Binance Trading Bot Dependencies
+# Discord to Binance Trading Bot v2.1 Dependencies
 
-# Discord
+# Core Dependencies
 discord.py>=2.3.0
-
-# Binance
 binance-connector>=3.5.0
-
-# Environment and Config
 python-dotenv>=1.0.0
 
-# Utilities
+# Async & Networking
 aiohttp>=3.9.0
 requests>=2.31.0
 
-# Optional: For enhanced performance
-uvloop>=0.19.0  # Linux/Mac only
+# Web Dashboard
+flask>=3.0.0
+flask-cors>=4.0.0
+
+# Monitoring
+psutil>=5.9.0
+
+# Database
+# SQLite3 is included in Python standard library
+
+# Optional: Performance
+uvloop>=0.19.0  # Linux/Mac only - async performance boost

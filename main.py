@@ -2,32 +2,31 @@
 # -*- coding: utf-8 -*-
 """
 Discord -> Binance Futures Auto-Trading Bot
-Monitors Discord for trading signals and executes on Binance Futures
-Version: 2.0 - Production Ready with Enhanced Safety Features
+Version: 2.1 - Enhanced with concurrency control, persistence, and better error handling
 """
 
 import os
 import re
 import asyncio
 import logging
+import json
+import sqlite3
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
-import json
+from typing import Dict, List, Optional, Tuple, Any
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from enum import Enum
+from pathlib import Path
+import pickle
 
 import discord
 from discord import Intents
 from binance.um_futures import UMFutures
 from binance.error import ClientError
-from binance.lib.utils import config_logging
+from dotenv import load_dotenv
 
 # =================== CONFIGURATION ===================
-
-# Load environment variables
-from dotenv import load_dotenv
 load_dotenv()
 
 # Discord Configuration
@@ -41,8 +40,13 @@ USE_TESTNET = os.getenv("USE_TESTNET", "true").lower() == "true"
 
 # Trading Parameters
 DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "5"))
-RISK_PER_TRADE_USDT = Decimal(os.getenv("RISK_PER_TRADE_USDT", "10"))
+
+# Risk Management - Now supports both fixed and percentage-based
+RISK_MODE = os.getenv("RISK_MODE", "FIXED")  # FIXED or PERCENT
+RISK_PER_TRADE_USDT = Decimal(os.getenv("RISK_PER_TRADE_USDT", "10"))  # For FIXED mode
+RISK_PERCENT_PER_TRADE = Decimal(os.getenv("RISK_PERCENT_PER_TRADE", "2"))  # For PERCENT mode
 MAX_POSITION_SIZE_USDT = Decimal(os.getenv("MAX_POSITION_SIZE_USDT", "100"))
+MAX_POSITION_SIZE_PERCENT = Decimal(os.getenv("MAX_POSITION_SIZE_PERCENT", "10"))  # Max % of account
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
 
 # Safety Features
@@ -51,16 +55,16 @@ REQUIRED_SIGNAL_KEYWORD = os.getenv("REQUIRED_SIGNAL_KEYWORD", "ATLAS-7 SIGNAL")
 MIN_RISK_REWARD = Decimal(os.getenv("MIN_RISK_REWARD", "2.0"))
 MAX_SLIPPAGE_PERCENT = Decimal(os.getenv("MAX_SLIPPAGE_PERCENT", "0.5"))
 
+# Persistence
+PERSISTENCE_FILE = os.getenv("PERSISTENCE_FILE", "bot_state.db")
+
 # Logging Configuration
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 LOG_FILE = os.getenv("LOG_FILE", "trading_bot.log")
 
 # =================== LOGGING SETUP ===================
-
-# Create logs directory if it doesn't exist
 os.makedirs("logs", exist_ok=True)
 
-# Configure logging
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -84,17 +88,43 @@ class TradingSignal:
     side: OrderSide
     entries: List[Decimal]
     stop_loss: Decimal
-    take_profits: List[Tuple[Decimal, int]]  # (price, percentage)
+    take_profits: List[Tuple[Decimal, int]]
     timestamp: datetime
     raw_message: str
+    message_id: int = None
+    
+    def to_dict(self) -> dict:
+        """Convert to dictionary for persistence"""
+        return {
+            'symbol': self.symbol,
+            'side': self.side.name,
+            'entries': [str(e) for e in self.entries],
+            'stop_loss': str(self.stop_loss),
+            'take_profits': [(str(tp), pct) for tp, pct in self.take_profits],
+            'timestamp': self.timestamp.isoformat(),
+            'raw_message': self.raw_message,
+            'message_id': self.message_id
+        }
+    
+    @classmethod
+    def from_dict(cls, data: dict) -> 'TradingSignal':
+        """Create from dictionary"""
+        return cls(
+            symbol=data['symbol'],
+            side=OrderSide[data['side']],
+            entries=[Decimal(e) for e in data['entries']],
+            stop_loss=Decimal(data['stop_loss']),
+            take_profits=[(Decimal(tp), pct) for tp, pct in data['take_profits']],
+            timestamp=datetime.fromisoformat(data['timestamp']),
+            raw_message=data['raw_message'],
+            message_id=data.get('message_id')
+        )
     
     def validate(self) -> bool:
         """Validate signal parameters"""
-        # Check if we have valid entries
         if not self.entries or len(self.entries) == 0:
             return False
         
-        # Check stop loss validity
         if self.side == OrderSide.LONG:
             if self.stop_loss >= min(self.entries):
                 logger.warning(f"Invalid LONG signal: SL {self.stop_loss} >= Entry {min(self.entries)}")
@@ -104,7 +134,6 @@ class TradingSignal:
                 logger.warning(f"Invalid SHORT signal: SL {self.stop_loss} <= Entry {max(self.entries)}")
                 return False
         
-        # Check take profits validity
         for tp, _ in self.take_profits:
             if self.side == OrderSide.LONG:
                 if tp <= max(self.entries):
@@ -130,10 +159,110 @@ class TradingSignal:
         
         return reward / risk if risk > 0 else Decimal("0")
 
-# =================== BINANCE CLIENT ===================
+# =================== PERSISTENCE MANAGER ===================
+
+class PersistenceManager:
+    """Manages bot state persistence using SQLite"""
+    
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._init_db()
+    
+    def _init_db(self):
+        """Initialize database tables"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS processed_signals (
+                    message_id INTEGER PRIMARY KEY,
+                    symbol TEXT,
+                    side TEXT,
+                    timestamp TEXT,
+                    processed_at TEXT
+                )
+            """)
+            
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS active_orders (
+                    order_id TEXT PRIMARY KEY,
+                    symbol TEXT,
+                    side TEXT,
+                    type TEXT,
+                    quantity TEXT,
+                    price TEXT,
+                    status TEXT,
+                    created_at TEXT
+                )
+            """)
+            
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS bot_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TEXT
+                )
+            """)
+            conn.commit()
+    
+    def is_signal_processed(self, message_id: int) -> bool:
+        """Check if a signal has been processed"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT 1 FROM processed_signals WHERE message_id = ?",
+                (message_id,)
+            )
+            return cursor.fetchone() is not None
+    
+    def mark_signal_processed(self, signal: TradingSignal):
+        """Mark a signal as processed"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO processed_signals 
+                (message_id, symbol, side, timestamp, processed_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                signal.message_id,
+                signal.symbol,
+                signal.side.name,
+                signal.timestamp.isoformat(),
+                datetime.now().isoformat()
+            ))
+            conn.commit()
+    
+    def clean_old_signals(self, days: int = 7):
+        """Remove signals older than specified days"""
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "DELETE FROM processed_signals WHERE processed_at < ?",
+                (cutoff,)
+            )
+            conn.commit()
+    
+    def save_state(self, key: str, value: Any):
+        """Save arbitrary state data"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO bot_state (key, value, updated_at)
+                VALUES (?, ?, ?)
+            """, (key, json.dumps(value), datetime.now().isoformat()))
+            conn.commit()
+    
+    def get_state(self, key: str, default=None) -> Any:
+        """Get state data"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT value FROM bot_state WHERE key = ?",
+                (key,)
+            )
+            row = cursor.fetchone()
+            if row:
+                return json.loads(row[0])
+            return default
+
+# =================== ENHANCED BINANCE CLIENT ===================
 
 class BinanceTrader:
-    """Enhanced Binance Futures trading client with safety features"""
+    """Enhanced Binance Futures trading client with better error handling"""
     
     def __init__(self):
         base_url = "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com"
@@ -145,27 +274,35 @@ class BinanceTrader:
         self.symbol_info = {}
         self.open_positions = {}
         self.pending_orders = {}
-        self._load_exchange_info()
+        self._load_exchange_info_with_retry()
     
-    def _load_exchange_info(self):
-        """Load and cache exchange trading rules"""
-        try:
-            info = self.client.exchange_info()
-            for symbol in info['symbols']:
-                self.symbol_info[symbol['symbol']] = {
-                    'pricePrecision': symbol['pricePrecision'],
-                    'quantityPrecision': symbol['quantityPrecision'],
-                    'minQty': Decimal(next(f['minQty'] for f in symbol['filters'] if f['filterType'] == 'LOT_SIZE')),
-                    'minNotional': Decimal(next(f['notional'] for f in symbol['filters'] if f['filterType'] == 'MIN_NOTIONAL')),
-                    'tickSize': Decimal(next(f['tickSize'] for f in symbol['filters'] if f['filterType'] == 'PRICE_FILTER'))
-                }
-            logger.info(f"Loaded exchange info for {len(self.symbol_info)} symbols")
-        except Exception as e:
-            logger.error(f"Failed to load exchange info: {e}")
+    def _load_exchange_info_with_retry(self, max_retries: int = 5):
+        """Load exchange info with retry logic"""
+        for attempt in range(max_retries):
+            try:
+                info = self.client.exchange_info()
+                for symbol in info['symbols']:
+                    self.symbol_info[symbol['symbol']] = {
+                        'pricePrecision': symbol['pricePrecision'],
+                        'quantityPrecision': symbol['quantityPrecision'],
+                        'minQty': Decimal(next(f['minQty'] for f in symbol['filters'] if f['filterType'] == 'LOT_SIZE')),
+                        'minNotional': Decimal(next(f['notional'] for f in symbol['filters'] if f['filterType'] == 'MIN_NOTIONAL')),
+                        'tickSize': Decimal(next(f['tickSize'] for f in symbol['filters'] if f['filterType'] == 'PRICE_FILTER'))
+                    }
+                logger.info(f"Loaded exchange info for {len(self.symbol_info)} symbols")
+                return
+            except Exception as e:
+                logger.error(f"Attempt {attempt + 1}/{max_retries} failed to load exchange info: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+        
+        logger.critical("Failed to load exchange info after all retries")
+        raise RuntimeError("Cannot proceed without exchange info")
     
     def round_price(self, symbol: str, price: Decimal) -> Decimal:
         """Round price to valid tick size"""
         if symbol not in self.symbol_info:
+            logger.warning(f"Symbol {symbol} not in exchange info, using default precision")
             return price.quantize(Decimal("0.001"))
         
         tick_size = self.symbol_info[symbol]['tickSize']
@@ -174,15 +311,24 @@ class BinanceTrader:
     def round_quantity(self, symbol: str, qty: Decimal) -> Decimal:
         """Round quantity to valid step size"""
         if symbol not in self.symbol_info:
+            logger.warning(f"Symbol {symbol} not in exchange info, using default precision")
             return qty.quantize(Decimal("0.001"))
         
         precision = self.symbol_info[symbol]['quantityPrecision']
         return qty.quantize(Decimal(10) ** -precision, rounding=ROUND_DOWN)
     
-    def calculate_position_size(self, signal: TradingSignal) -> Optional[Decimal]:
-        """Calculate position size based on risk management rules"""
+    def get_account_balance(self) -> Optional[Decimal]:
+        """Get current USDT balance"""
         try:
-            # Get current account balance
+            account = self.client.account()
+            return Decimal(account['totalWalletBalance'])
+        except Exception as e:
+            logger.error(f"Failed to get account balance: {e}")
+            return None
+    
+    def calculate_position_size(self, signal: TradingSignal) -> Optional[Decimal]:
+        """Calculate position size with dynamic risk management"""
+        try:
             account = self.client.account()
             balance = Decimal(account['totalWalletBalance'])
             
@@ -192,19 +338,32 @@ class BinanceTrader:
                 logger.warning(f"Maximum open positions reached: {len(positions)}/{MAX_OPEN_POSITIONS}")
                 return None
             
+            # Calculate risk amount based on mode
+            if RISK_MODE == "PERCENT":
+                risk_amount = balance * RISK_PERCENT_PER_TRADE / 100
+                max_position_value = balance * MAX_POSITION_SIZE_PERCENT / 100
+            else:
+                risk_amount = RISK_PER_TRADE_USDT
+                max_position_value = MAX_POSITION_SIZE_USDT
+            
             # Calculate position size based on risk
             avg_entry = sum(signal.entries) / len(signal.entries)
             risk_distance = abs(avg_entry - signal.stop_loss) / avg_entry
             
             # Position size = Risk Amount / Risk Distance
-            position_value = RISK_PER_TRADE_USDT / risk_distance
+            position_value = risk_amount / risk_distance
             
             # Apply maximum position size limit
-            position_value = min(position_value, MAX_POSITION_SIZE_USDT)
+            position_value = min(position_value, max_position_value)
             
-            # Calculate quantity
+            # Get current price and check slippage
             current_price = self.get_current_price(signal.symbol)
             if not current_price:
+                return None
+            
+            # Check slippage
+            if self.check_slippage(avg_entry, current_price) > MAX_SLIPPAGE_PERCENT:
+                logger.warning(f"Slippage too high: {self.check_slippage(avg_entry, current_price)}% > {MAX_SLIPPAGE_PERCENT}%")
                 return None
             
             quantity = position_value / current_price
@@ -217,11 +376,16 @@ class BinanceTrader:
                     logger.warning(f"Position size below minimum notional: {quantity * current_price} < {min_notional}")
                     return None
             
+            logger.info(f"Position sizing: Risk ${risk_amount:.2f} | Size: {quantity} @ ${current_price}")
             return quantity
             
         except Exception as e:
             logger.error(f"Failed to calculate position size: {e}")
             return None
+    
+    def check_slippage(self, expected_price: Decimal, current_price: Decimal) -> Decimal:
+        """Calculate slippage percentage"""
+        return abs((current_price - expected_price) / expected_price * 100)
     
     def get_current_price(self, symbol: str) -> Optional[Decimal]:
         """Get current market price"""
@@ -242,8 +406,8 @@ class BinanceTrader:
             logger.error(f"Failed to set leverage: {e}")
             return False
     
-    def place_order_set(self, signal: TradingSignal, quantity: Decimal) -> bool:
-        """Place a complete order set (entries, SL, TPs)"""
+    def place_order_set_with_partial_handling(self, signal: TradingSignal, quantity: Decimal) -> dict:
+        """Place orders with partial fill handling"""
         if not ENABLE_TRADING:
             logger.info("SIMULATION MODE: Would place orders:")
             logger.info(f"  Symbol: {signal.symbol}")
@@ -252,15 +416,22 @@ class BinanceTrader:
             logger.info(f"  Entries: {signal.entries}")
             logger.info(f"  Stop Loss: {signal.stop_loss}")
             logger.info(f"  Take Profits: {signal.take_profits}")
-            return True
+            return {'success': True, 'simulation': True}
+        
+        result = {
+            'success': False,
+            'entry_orders': [],
+            'filled_quantity': Decimal("0"),
+            'sl_order': None,
+            'tp_orders': []
+        }
         
         try:
             # Set leverage
             if not self.set_leverage(signal.symbol, DEFAULT_LEVERAGE):
-                return False
+                return result
             
-            # Place entry orders
-            entry_orders = []
+            # Place entry orders and track filled quantity
             qty_per_entry = quantity / len(signal.entries)
             
             for i, entry_price in enumerate(signal.entries):
@@ -274,44 +445,54 @@ class BinanceTrader:
                         timeInForce="GTC",
                         workingType="CONTRACT_PRICE"
                     )
-                    entry_orders.append(order)
+                    result['entry_orders'].append(order)
                     logger.info(f"Placed entry order {i+1}: {order['orderId']}")
+                    
+                    # Wait a bit and check if filled (simplified - in production use websocket)
+                    time.sleep(1)
+                    order_status = self.client.query_order(
+                        symbol=signal.symbol,
+                        orderId=order['orderId']
+                    )
+                    if order_status['status'] == 'FILLED':
+                        result['filled_quantity'] += Decimal(order_status['executedQty'])
+                        
                 except Exception as e:
                     logger.error(f"Failed to place entry order {i+1}: {e}")
             
-            if not entry_orders:
+            if not result['entry_orders']:
                 logger.error("Failed to place any entry orders")
-                return False
+                return result
             
-            # Place stop loss order
+            # Use actual filled quantity for SL/TP (or full quantity if not immediately filled)
+            actual_qty = result['filled_quantity'] if result['filled_quantity'] > 0 else quantity
+            
+            # Place stop loss with actual quantity
             sl_side = "SELL" if signal.side == OrderSide.LONG else "BUY"
             try:
                 sl_order = self.client.new_order(
                     symbol=signal.symbol,
                     side=sl_side,
                     type="STOP_MARKET",
-                    quantity=float(quantity),
+                    quantity=float(actual_qty),
                     stopPrice=float(self.round_price(signal.symbol, signal.stop_loss)),
                     workingType="CONTRACT_PRICE",
                     priceProtect=True
                 )
+                result['sl_order'] = sl_order
                 logger.info(f"Placed stop loss order: {sl_order['orderId']}")
             except Exception as e:
                 logger.error(f"Failed to place stop loss: {e}")
                 # Cancel entry orders if SL fails
-                for order in entry_orders:
-                    try:
-                        self.client.cancel_order(symbol=signal.symbol, orderId=order['orderId'])
-                    except:
-                        pass
-                return False
+                self._cancel_orders(signal.symbol, result['entry_orders'])
+                return result
             
-            # Place take profit orders
+            # Place take profit orders with actual quantity
             tp_side = "SELL" if signal.side == OrderSide.LONG else "BUY"
-            remaining_qty = quantity
+            remaining_qty = actual_qty
             
             for i, (tp_price, tp_percent) in enumerate(signal.take_profits):
-                tp_qty = quantity * Decimal(tp_percent) / 100
+                tp_qty = actual_qty * Decimal(tp_percent) / 100
                 tp_qty = min(tp_qty, remaining_qty)
                 remaining_qty -= tp_qty
                 
@@ -329,23 +510,26 @@ class BinanceTrader:
                         reduceOnly=True,
                         workingType="CONTRACT_PRICE"
                     )
+                    result['tp_orders'].append(tp_order)
                     logger.info(f"Placed TP order {i+1}: {tp_order['orderId']}")
                 except Exception as e:
                     logger.error(f"Failed to place TP {i+1}: {e}")
             
-            # Store order info
-            self.pending_orders[signal.symbol] = {
-                'signal': signal,
-                'entry_orders': entry_orders,
-                'sl_order': sl_order,
-                'timestamp': datetime.now()
-            }
-            
-            return True
+            result['success'] = True
+            return result
             
         except Exception as e:
             logger.error(f"Failed to place order set: {e}")
-            return False
+            return result
+    
+    def _cancel_orders(self, symbol: str, orders: List[dict]):
+        """Cancel multiple orders"""
+        for order in orders:
+            try:
+                self.client.cancel_order(symbol=symbol, orderId=order['orderId'])
+                logger.info(f"Cancelled order {order['orderId']}")
+            except Exception as e:
+                logger.error(f"Failed to cancel order {order['orderId']}: {e}")
     
     def check_positions(self):
         """Monitor and log current positions"""
@@ -363,14 +547,12 @@ class BinanceTrader:
             logger.error(f"Failed to check positions: {e}")
             return []
 
-# =================== SIGNAL PARSER ===================
+# =================== SIGNAL PARSER (Same as before) ===================
 
 class SignalParser:
     """Enhanced signal parser with validation"""
     
-    # Updated regex to handle various signal formats
     SIGNAL_PATTERNS = [
-        # Pattern 1: Original format
         re.compile(
             r"(?P<keyword>ATLAS-7\s+SIGNAL)[:\s\-]*"
             r"(?P<pair>[A-Z]{2,10}USDT(?:\.P)?)\s+"
@@ -383,38 +565,24 @@ class SignalParser:
             r"(?:[\s\S]*?TP\s*3[:\s]*\$?(?P<tp3>\d+(?:\.\d+)?)[^\d]*(?P<tp3_pct>\d+)%?)?"
             r"(?:[\s\S]*?TP\s*4[:\s]*\$?(?P<tp4>\d+(?:\.\d+)?)[^\d]*(?P<tp4_pct>\d+)%?)?",
             re.IGNORECASE | re.MULTILINE
-        ),
-        # Pattern 2: Alternative format
-        re.compile(
-            r"(?P<keyword>ATLAS-7\s+SIGNAL)[:\s\-]*"
-            r"(?P<pair>[A-Z]{2,10}USDT(?:\.P)?)\s+"
-            r"(?P<side>LONG|SHORT)"
-            r"[\s\S]*?Entries?[:\s]*\$?(?P<entry1>\d+(?:\.\d+)?)"
-            r"(?:[,\s]+\$?(?P<entry2>\d+(?:\.\d+)?))?"
-            r"[\s\S]*?SL[:\s]*\$?(?P<sl>\d+(?:\.\d+)?)"
-            r"[\s\S]*?Targets?[:\s]*"
-            r"\$?(?P<tp1>\d+(?:\.\d+)?)"
-            r"(?:[,\s]+\$?(?P<tp2>\d+(?:\.\d+)?))?"
-            r"(?:[,\s]+\$?(?P<tp3>\d+(?:\.\d+)?))?"
-            r"(?:[,\s]+\$?(?P<tp4>\d+(?:\.\d+)?))?",
-            re.IGNORECASE | re.MULTILINE
         )
     ]
     
     @classmethod
-    def parse(cls, message: str) -> Optional[TradingSignal]:
+    def parse(cls, message_content: str, message_id: int = None) -> Optional[TradingSignal]:
         """Parse a message into a TradingSignal"""
-        # Check for required keyword
-        if REQUIRED_SIGNAL_KEYWORD not in message.upper():
+        if REQUIRED_SIGNAL_KEYWORD not in message_content.upper():
             return None
         
-        # Try each pattern
         for pattern in cls.SIGNAL_PATTERNS:
-            match = pattern.search(message)
+            match = pattern.search(message_content)
             if match:
-                return cls._process_match(match, message)
+                signal = cls._process_match(match, message_content)
+                if signal:
+                    signal.message_id = message_id
+                return signal
         
-        logger.debug(f"No pattern matched for message: {message[:100]}...")
+        logger.debug(f"No pattern matched for message: {message_content[:100]}...")
         return None
     
     @classmethod
@@ -423,11 +591,9 @@ class SignalParser:
         try:
             groups = match.groupdict()
             
-            # Extract symbol and side
-            symbol = groups['pair'].replace('.P', '')  # Remove .P suffix if present
+            symbol = groups['pair'].replace('.P', '')
             side = OrderSide.LONG if groups['side'].upper() == 'LONG' else OrderSide.SHORT
             
-            # Extract entries
             entries = []
             for i in range(1, 3):
                 entry_key = f'entry{i}'
@@ -438,12 +604,10 @@ class SignalParser:
                 logger.warning("No valid entries found")
                 return None
             
-            # Extract stop loss
             stop_loss = Decimal(groups['sl'])
             
-            # Extract take profits with percentages
             take_profits = []
-            default_percentages = [25, 35, 25, 15]  # Default TP percentages
+            default_percentages = [25, 35, 25, 15]
             
             for i in range(1, 5):
                 tp_key = f'tp{i}'
@@ -452,7 +616,6 @@ class SignalParser:
                 if tp_key in groups and groups[tp_key]:
                     tp_price = Decimal(groups[tp_key])
                     
-                    # Get percentage or use default
                     if tp_pct_key in groups and groups[tp_pct_key]:
                         tp_pct = int(groups[tp_pct_key])
                     else:
@@ -460,7 +623,6 @@ class SignalParser:
                     
                     take_profits.append((tp_price, tp_pct))
             
-            # Create signal object
             signal = TradingSignal(
                 symbol=symbol,
                 side=side,
@@ -468,15 +630,13 @@ class SignalParser:
                 stop_loss=stop_loss,
                 take_profits=take_profits,
                 timestamp=datetime.now(),
-                raw_message=raw_message[:500]  # Store first 500 chars
+                raw_message=raw_message[:500]
             )
             
-            # Validate signal
             if not signal.validate():
                 logger.warning("Signal validation failed")
                 return None
             
-            # Check risk-reward ratio
             rr = signal.calculate_risk_reward()
             if rr < MIN_RISK_REWARD:
                 logger.warning(f"Risk-reward ratio too low: {rr} < {MIN_RISK_REWARD}")
@@ -489,10 +649,10 @@ class SignalParser:
             logger.error(f"Error processing match: {e}")
             return None
 
-# =================== DISCORD BOT ===================
+# =================== ENHANCED DISCORD BOT ===================
 
 class TradingBot(discord.Client):
-    """Discord bot that monitors signals and executes trades"""
+    """Discord bot with concurrency control and persistence"""
     
     def __init__(self):
         intents = Intents.default()
@@ -502,8 +662,12 @@ class TradingBot(discord.Client):
         
         self.trader = BinanceTrader()
         self.parser = SignalParser()
-        self.processed_signals = set()  # Track processed messages to avoid duplicates
+        self.persistence = PersistenceManager(PERSISTENCE_FILE)
         self.last_position_check = datetime.now()
+        
+        # Concurrency control
+        self.order_lock = asyncio.Lock()
+        self.processing_signals = set()
     
     async def on_ready(self):
         """Bot startup"""
@@ -511,106 +675,143 @@ class TradingBot(discord.Client):
         logger.info(f"Monitoring channel: {DISCORD_CHANNEL_ID}")
         logger.info(f"Trading enabled: {ENABLE_TRADING}")
         logger.info(f"Testnet mode: {USE_TESTNET}")
+        logger.info(f"Risk mode: {RISK_MODE}")
         
-        # Start position monitor task
+        # Show current balance
+        balance = self.trader.get_account_balance()
+        if balance:
+            logger.info(f"Account balance: ${balance}")
+        
+        # Start background tasks
         asyncio.create_task(self.monitor_positions())
+        asyncio.create_task(self.cleanup_old_data())
     
     async def on_message(self, message: discord.Message):
         """Process incoming messages"""
-        # Filter: correct channel
+        # Filters
         if message.channel.id != DISCORD_CHANNEL_ID:
             return
         
-        # Filter: not self
         if message.author == self.user:
             return
         
-        # Filter: not already processed
-        if message.id in self.processed_signals:
+        # Check persistence for duplicate
+        if self.persistence.is_signal_processed(message.id):
+            logger.debug(f"Message {message.id} already processed")
             return
         
-        # Combine message content and embeds
-        content = message.content or ""
-        
-        if message.embeds:
-            for embed in message.embeds:
-                if embed.title:
-                    content += f"\n{embed.title}"
-                if embed.description:
-                    content += f"\n{embed.description}"
-                for field in embed.fields:
-                    content += f"\n{field.name}: {field.value}"
-        
-        # Skip if no content
-        if not content.strip():
+        # Check if currently processing this signal
+        if message.id in self.processing_signals:
             return
         
-        # Parse signal
-        signal = self.parser.parse(content)
-        if not signal:
-            return
-        
-        # Mark as processed
-        self.processed_signals.add(message.id)
-        
-        # Process signal
-        await self.process_signal(signal, message)
-    
-    async def process_signal(self, signal: TradingSignal, message: discord.Message):
-        """Process and execute a trading signal"""
-        logger.info(f"Processing signal from message {message.id}")
+        # Mark as processing
+        self.processing_signals.add(message.id)
         
         try:
-            # Calculate position size
-            quantity = self.trader.calculate_position_size(signal)
-            if not quantity:
-                await message.reply("❌ Signal rejected: Position sizing failed")
+            # Combine message content and embeds
+            content = message.content or ""
+            
+            if message.embeds:
+                for embed in message.embeds:
+                    if embed.title:
+                        content += f"\n{embed.title}"
+                    if embed.description:
+                        content += f"\n{embed.description}"
+                    for field in embed.fields:
+                        content += f"\n{field.name}: {field.value}"
+            
+            if not content.strip():
                 return
             
-            # Execute trades
-            success = self.trader.place_order_set(signal, quantity)
+            # Parse signal
+            signal = self.parser.parse(content, message.id)
+            if not signal:
+                return
             
-            if success:
-                rr = signal.calculate_risk_reward()
-                response = (
-                    f"✅ **Signal Executed**\n"
-                    f"Symbol: {signal.symbol}\n"
-                    f"Side: {signal.side.name}\n"
-                    f"Quantity: {quantity}\n"
-                    f"Risk/Reward: {rr:.2f}\n"
-                    f"Mode: {'LIVE' if ENABLE_TRADING else 'SIMULATION'}"
-                )
-            else:
-                response = "❌ **Signal Failed**\nCheck logs for details"
+            # Process signal with lock
+            await self.process_signal(signal, message)
             
-            await message.reply(response)
-            
-        except Exception as e:
-            logger.error(f"Error processing signal: {e}")
-            await message.reply(f"❌ Error: {str(e)[:200]}")
+        finally:
+            # Remove from processing set
+            self.processing_signals.discard(message.id)
+    
+    async def process_signal(self, signal: TradingSignal, message: discord.Message):
+        """Process signal with concurrency control"""
+        logger.info(f"Processing signal from message {message.id}")
+        
+        # Use lock to prevent concurrent order placement
+        async with self.order_lock:
+            try:
+                # Mark as processed immediately to prevent duplicates
+                self.persistence.mark_signal_processed(signal)
+                
+                # Calculate position size
+                quantity = self.trader.calculate_position_size(signal)
+                if not quantity:
+                    await message.reply("❌ Signal rejected: Position sizing or slippage check failed")
+                    return
+                
+                # Execute trades with partial fill handling
+                result = self.trader.place_order_set_with_partial_handling(signal, quantity)
+                
+                if result['success']:
+                    rr = signal.calculate_risk_reward()
+                    
+                    # Get account balance for context
+                    balance = self.trader.get_account_balance()
+                    balance_str = f" | Balance: ${balance}" if balance else ""
+                    
+                    response = (
+                        f"✅ **Signal Executed**\n"
+                        f"Symbol: {signal.symbol}\n"
+                        f"Side: {signal.side.name}\n"
+                        f"Quantity: {quantity}\n"
+                        f"Risk/Reward: {rr:.2f}\n"
+                        f"Mode: {'LIVE' if ENABLE_TRADING else 'SIMULATION'}"
+                        f"{balance_str}"
+                    )
+                    
+                    if 'filled_quantity' in result and result['filled_quantity'] > 0:
+                        response += f"\nFilled: {result['filled_quantity']}/{quantity}"
+                else:
+                    response = "❌ **Signal Failed**\nCheck logs for details"
+                
+                await message.reply(response)
+                
+            except Exception as e:
+                logger.error(f"Error processing signal: {e}")
+                await message.reply(f"❌ Error: {str(e)[:200]}")
     
     async def monitor_positions(self):
-        """Periodic position monitoring task"""
+        """Periodic position monitoring"""
         while True:
             try:
-                await asyncio.sleep(60)  # Check every minute
+                await asyncio.sleep(60)
                 
-                # Check positions every 5 minutes
                 if datetime.now() - self.last_position_check > timedelta(minutes=5):
                     positions = self.trader.check_positions()
                     self.last_position_check = datetime.now()
                     
-                    # Clean up old processed signals (keep last 100)
-                    if len(self.processed_signals) > 100:
-                        self.processed_signals = set(list(self.processed_signals)[-100:])
+                    # Save current position count
+                    self.persistence.save_state('position_count', len(positions))
                 
             except Exception as e:
                 logger.error(f"Position monitor error: {e}")
+    
+    async def cleanup_old_data(self):
+        """Periodic cleanup of old data"""
+        while True:
+            try:
+                await asyncio.sleep(86400)  # Daily
+                self.persistence.clean_old_signals(days=7)
+                logger.info("Cleaned up old signal data")
+            except Exception as e:
+                logger.error(f"Cleanup error: {e}")
 
 # =================== MAIN EXECUTION ===================
 
 def validate_config():
-    """Validate configuration before starting"""
+    """Validate configuration"""
     errors = []
     
     if not DISCORD_BOT_TOKEN:
@@ -624,6 +825,9 @@ def validate_config():
     
     if not BINANCE_API_SECRET:
         errors.append("BINANCE_API_SECRET not set")
+    
+    if RISK_MODE not in ["FIXED", "PERCENT"]:
+        errors.append("RISK_MODE must be FIXED or PERCENT")
     
     if errors:
         for error in errors:
@@ -642,15 +846,13 @@ def validate_config():
 def main():
     """Main entry point"""
     logger.info("=" * 50)
-    logger.info("Discord -> Binance Auto-Trading Bot Starting")
+    logger.info("Discord -> Binance Auto-Trading Bot v2.1")
     logger.info("=" * 50)
     
-    # Validate configuration
     if not validate_config():
         logger.error("Configuration validation failed. Exiting.")
         return
     
-    # Create and run bot
     try:
         bot = TradingBot()
         bot.run(DISCORD_BOT_TOKEN)

@@ -1,13 +1,14 @@
-# Discord to Binance Trading Bot v2.1 Dependencies
+# Discord to Binance Trading Bot v3.0 Dependencies (CCXT)
 
 # Core Dependencies
 discord.py>=2.3.0
-binance-connector>=3.5.0
+ccxt>=4.1.0
 python-dotenv>=1.0.0
 
 # Async & Networking
 aiohttp>=3.9.0
 requests>=2.31.0
+websockets>=11.0
 
 # Web Dashboard
 flask>=3.0.0
@@ -21,3 +22,4 @@ psutil>=5.9.0
 
 # Optional: Performance
 uvloop>=0.19.0  # Linux/Mac only - async performance boost
+aiodns>=3.0.0    # Async DNS resolution for better performance

@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Discord -> Binance Futures Auto-Trading Bot
-Version: 2.1 - Enhanced with concurrency control, persistence, and better error handling
+Version: 3.0 - Using CCXT library for better reliability
 """
 
 import os
@@ -11,6 +11,8 @@ import asyncio
 import logging
 import json
 import sqlite3
+import ccxt
+import ccxt.async_support as ccxt_async
 from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
@@ -18,12 +20,9 @@ import time
 from dataclasses import dataclass, asdict
 from enum import Enum
 from pathlib import Path
-import pickle
 
 import discord
 from discord import Intents
-from binance.um_futures import UMFutures
-from binance.error import ClientError
 from dotenv import load_dotenv
 
 # =================== CONFIGURATION ===================
@@ -41,12 +40,12 @@ USE_TESTNET = os.getenv("USE_TESTNET", "true").lower() == "true"
 # Trading Parameters
 DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "5"))
 
-# Risk Management - Now supports both fixed and percentage-based
+# Risk Management
 RISK_MODE = os.getenv("RISK_MODE", "FIXED")  # FIXED or PERCENT
-RISK_PER_TRADE_USDT = Decimal(os.getenv("RISK_PER_TRADE_USDT", "10"))  # For FIXED mode
-RISK_PERCENT_PER_TRADE = Decimal(os.getenv("RISK_PERCENT_PER_TRADE", "2"))  # For PERCENT mode
+RISK_PER_TRADE_USDT = Decimal(os.getenv("RISK_PER_TRADE_USDT", "10"))
+RISK_PERCENT_PER_TRADE = Decimal(os.getenv("RISK_PERCENT_PER_TRADE", "2"))
 MAX_POSITION_SIZE_USDT = Decimal(os.getenv("MAX_POSITION_SIZE_USDT", "100"))
-MAX_POSITION_SIZE_PERCENT = Decimal(os.getenv("MAX_POSITION_SIZE_PERCENT", "10"))  # Max % of account
+MAX_POSITION_SIZE_PERCENT = Decimal(os.getenv("MAX_POSITION_SIZE_PERCENT", "10"))
 MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
 
 # Safety Features
@@ -78,8 +77,8 @@ logger = logging.getLogger(__name__)
 # =================== DATA STRUCTURES ===================
 
 class OrderSide(Enum):
-    LONG = "BUY"
-    SHORT = "SELL"
+    LONG = "buy"  # CCXT uses lowercase
+    SHORT = "sell"
 
 @dataclass
 class TradingSignal:
@@ -259,83 +258,127 @@ class PersistenceManager:
                 return json.loads(row[0])
             return default
 
-# =================== ENHANCED BINANCE CLIENT ===================
+# =================== CCXT BINANCE CLIENT ===================
 
 class BinanceTrader:
-    """Enhanced Binance Futures trading client with better error handling"""
+    """Binance Futures trading client using CCXT"""
     
     def __init__(self):
-        base_url = "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com"
-        self.client = UMFutures(
-            key=BINANCE_API_KEY,
-            secret=BINANCE_API_SECRET,
-            base_url=base_url
-        )
-        self.symbol_info = {}
+        # Configure exchange
+        exchange_config = {
+            'apiKey': BINANCE_API_KEY,
+            'secret': BINANCE_API_SECRET,
+            'enableRateLimit': True,
+            'options': {
+                'defaultType': 'future',  # Use futures market
+                'adjustForTimeDifference': True,
+            }
+        }
+        
+        if USE_TESTNET:
+            exchange_config['options']['defaultType'] = 'future'
+            exchange_config['options']['testnet'] = True
+            # CCXT testnet URLs for Binance
+            exchange_config['urls'] = {
+                'api': {
+                    'public': 'https://testnet.binancefuture.com/fapi/v1',
+                    'private': 'https://testnet.binancefuture.com/fapi/v1',
+                    'fapiPublic': 'https://testnet.binancefuture.com/fapi/v1',
+                    'fapiPrivate': 'https://testnet.binancefuture.com/fapi/v1',
+                }
+            }
+        
+        self.exchange = ccxt.binance(exchange_config)
+        self.markets = {}
         self.open_positions = {}
         self.pending_orders = {}
-        self._load_exchange_info_with_retry()
+        self._load_markets_with_retry()
     
-    def _load_exchange_info_with_retry(self, max_retries: int = 5):
-        """Load exchange info with retry logic"""
+    def _load_markets_with_retry(self, max_retries: int = 5):
+        """Load market info with retry logic"""
         for attempt in range(max_retries):
             try:
-                info = self.client.exchange_info()
-                for symbol in info['symbols']:
-                    self.symbol_info[symbol['symbol']] = {
-                        'pricePrecision': symbol['pricePrecision'],
-                        'quantityPrecision': symbol['quantityPrecision'],
-                        'minQty': Decimal(next(f['minQty'] for f in symbol['filters'] if f['filterType'] == 'LOT_SIZE')),
-                        'minNotional': Decimal(next(f['notional'] for f in symbol['filters'] if f['filterType'] == 'MIN_NOTIONAL')),
-                        'tickSize': Decimal(next(f['tickSize'] for f in symbol['filters'] if f['filterType'] == 'PRICE_FILTER'))
-                    }
-                logger.info(f"Loaded exchange info for {len(self.symbol_info)} symbols")
+                self.markets = self.exchange.load_markets()
+                logger.info(f"Loaded {len(self.markets)} markets from exchange")
                 return
             except Exception as e:
-                logger.error(f"Attempt {attempt + 1}/{max_retries} failed to load exchange info: {e}")
+                logger.error(f"Attempt {attempt + 1}/{max_retries} failed to load markets: {e}")
                 if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)  # Exponential backoff
+                    time.sleep(2 ** attempt)
         
-        logger.critical("Failed to load exchange info after all retries")
-        raise RuntimeError("Cannot proceed without exchange info")
+        logger.critical("Failed to load markets after all retries")
+        raise RuntimeError("Cannot proceed without market info")
     
-    def round_price(self, symbol: str, price: Decimal) -> Decimal:
-        """Round price to valid tick size"""
-        if symbol not in self.symbol_info:
-            logger.warning(f"Symbol {symbol} not in exchange info, using default precision")
-            return price.quantize(Decimal("0.001"))
-        
-        tick_size = self.symbol_info[symbol]['tickSize']
-        return (price / tick_size).quantize(Decimal("1")) * tick_size
+    def get_symbol_info(self, symbol: str) -> dict:
+        """Get symbol trading rules"""
+        if symbol in self.markets:
+            market = self.markets[symbol]
+            return {
+                'min_qty': market['limits']['amount']['min'],
+                'max_qty': market['limits']['amount']['max'],
+                'qty_precision': market['precision']['amount'],
+                'price_precision': market['precision']['price'],
+                'min_notional': market['limits']['cost']['min'] if 'cost' in market['limits'] else 10,
+                'tick_size': market['precision']['price']
+            }
+        return None
     
-    def round_quantity(self, symbol: str, qty: Decimal) -> Decimal:
-        """Round quantity to valid step size"""
-        if symbol not in self.symbol_info:
-            logger.warning(f"Symbol {symbol} not in exchange info, using default precision")
-            return qty.quantize(Decimal("0.001"))
-        
-        precision = self.symbol_info[symbol]['quantityPrecision']
-        return qty.quantize(Decimal(10) ** -precision, rounding=ROUND_DOWN)
+    def round_price(self, symbol: str, price: Decimal) -> float:
+        """Round price to valid precision"""
+        if symbol in self.markets:
+            precision = self.markets[symbol]['precision']['price']
+            if isinstance(precision, int):
+                return float(Decimal(str(price)).quantize(Decimal(10) ** -precision))
+            else:
+                # If precision is a tick size
+                tick = Decimal(str(precision))
+                return float((Decimal(str(price)) / tick).quantize(Decimal('1')) * tick)
+        return float(price)
+    
+    def round_quantity(self, symbol: str, qty: Decimal) -> float:
+        """Round quantity to valid precision"""
+        if symbol in self.markets:
+            precision = self.markets[symbol]['precision']['amount']
+            if isinstance(precision, int):
+                return float(Decimal(str(qty)).quantize(Decimal(10) ** -precision, rounding=ROUND_DOWN))
+            else:
+                # If precision is a step size
+                step = Decimal(str(precision))
+                return float((Decimal(str(qty)) / step).quantize(Decimal('1'), rounding=ROUND_DOWN) * step)
+        return float(qty)
     
     def get_account_balance(self) -> Optional[Decimal]:
         """Get current USDT balance"""
         try:
-            account = self.client.account()
-            return Decimal(account['totalWalletBalance'])
+            balance = self.exchange.fetch_balance()
+            usdt_balance = balance['USDT']['total'] if 'USDT' in balance else 0
+            return Decimal(str(usdt_balance))
         except Exception as e:
             logger.error(f"Failed to get account balance: {e}")
             return None
     
+    def get_open_positions(self) -> List[dict]:
+        """Get all open positions"""
+        try:
+            positions = self.exchange.fetch_positions()
+            return [p for p in positions if p['contracts'] != 0]
+        except Exception as e:
+            logger.error(f"Failed to get positions: {e}")
+            return []
+    
     def calculate_position_size(self, signal: TradingSignal) -> Optional[Decimal]:
         """Calculate position size with dynamic risk management"""
         try:
-            account = self.client.account()
-            balance = Decimal(account['totalWalletBalance'])
+            # Get account balance
+            balance = self.get_account_balance()
+            if not balance:
+                logger.error("Could not get account balance")
+                return None
             
             # Check maximum open positions
-            positions = [p for p in account['positions'] if Decimal(p['positionAmt']) != 0]
-            if len(positions) >= MAX_OPEN_POSITIONS:
-                logger.warning(f"Maximum open positions reached: {len(positions)}/{MAX_OPEN_POSITIONS}")
+            open_positions = self.get_open_positions()
+            if len(open_positions) >= MAX_OPEN_POSITIONS:
+                logger.warning(f"Maximum open positions reached: {len(open_positions)}/{MAX_OPEN_POSITIONS}")
                 return None
             
             # Calculate risk amount based on mode
@@ -357,57 +400,52 @@ class BinanceTrader:
             position_value = min(position_value, max_position_value)
             
             # Get current price and check slippage
-            current_price = self.get_current_price(signal.symbol)
-            if not current_price:
-                return None
+            ticker = self.exchange.fetch_ticker(signal.symbol)
+            current_price = Decimal(str(ticker['last']))
             
             # Check slippage
-            if self.check_slippage(avg_entry, current_price) > MAX_SLIPPAGE_PERCENT:
-                logger.warning(f"Slippage too high: {self.check_slippage(avg_entry, current_price)}% > {MAX_SLIPPAGE_PERCENT}%")
+            slippage = abs((current_price - avg_entry) / avg_entry * 100)
+            if slippage > MAX_SLIPPAGE_PERCENT:
+                logger.warning(f"Slippage too high: {slippage:.2f}% > {MAX_SLIPPAGE_PERCENT}%")
                 return None
             
+            # Calculate quantity
             quantity = position_value / current_price
-            quantity = self.round_quantity(signal.symbol, quantity)
             
-            # Validate minimum notional
-            if signal.symbol in self.symbol_info:
-                min_notional = self.symbol_info[signal.symbol]['minNotional']
+            # Get symbol info and validate
+            symbol_info = self.get_symbol_info(signal.symbol)
+            if symbol_info:
+                min_qty = Decimal(str(symbol_info['min_qty']))
+                if quantity < min_qty:
+                    logger.warning(f"Position size below minimum: {quantity} < {min_qty}")
+                    return None
+                
+                # Check minimum notional
+                min_notional = Decimal(str(symbol_info['min_notional']))
                 if quantity * current_price < min_notional:
-                    logger.warning(f"Position size below minimum notional: {quantity * current_price} < {min_notional}")
+                    logger.warning(f"Position value below minimum notional: {quantity * current_price} < {min_notional}")
                     return None
             
-            logger.info(f"Position sizing: Risk ${risk_amount:.2f} | Size: {quantity} @ ${current_price}")
+            logger.info(f"Position sizing: Risk ${risk_amount:.2f} | Size: {quantity:.4f} @ ${current_price:.2f}")
             return quantity
             
         except Exception as e:
             logger.error(f"Failed to calculate position size: {e}")
             return None
     
-    def check_slippage(self, expected_price: Decimal, current_price: Decimal) -> Decimal:
-        """Calculate slippage percentage"""
-        return abs((current_price - expected_price) / expected_price * 100)
-    
-    def get_current_price(self, symbol: str) -> Optional[Decimal]:
-        """Get current market price"""
-        try:
-            ticker = self.client.ticker_price(symbol=symbol)
-            return Decimal(ticker['price'])
-        except Exception as e:
-            logger.error(f"Failed to get current price for {symbol}: {e}")
-            return None
-    
     def set_leverage(self, symbol: str, leverage: int) -> bool:
         """Set leverage for symbol"""
         try:
-            self.client.change_leverage(symbol=symbol, leverage=leverage)
+            # CCXT method for setting leverage
+            self.exchange.set_leverage(leverage, symbol)
             logger.info(f"Set leverage for {symbol} to {leverage}x")
             return True
         except Exception as e:
             logger.error(f"Failed to set leverage: {e}")
             return False
     
-    def place_order_set_with_partial_handling(self, signal: TradingSignal, quantity: Decimal) -> dict:
-        """Place orders with partial fill handling"""
+    def place_order_set(self, signal: TradingSignal, quantity: Decimal) -> dict:
+        """Place complete order set with CCXT"""
         if not ENABLE_TRADING:
             logger.info("SIMULATION MODE: Would place orders:")
             logger.info(f"  Symbol: {signal.symbol}")
@@ -431,31 +469,31 @@ class BinanceTrader:
             if not self.set_leverage(signal.symbol, DEFAULT_LEVERAGE):
                 return result
             
-            # Place entry orders and track filled quantity
-            qty_per_entry = quantity / len(signal.entries)
+            # Convert quantity to float for CCXT
+            total_qty = self.round_quantity(signal.symbol, quantity)
+            
+            # Place entry orders
+            qty_per_entry = total_qty / len(signal.entries)
             
             for i, entry_price in enumerate(signal.entries):
                 try:
-                    order = self.client.new_order(
+                    order_side = signal.side.value
+                    order = self.exchange.create_order(
                         symbol=signal.symbol,
-                        side=signal.side.value,
-                        type="LIMIT",
-                        quantity=float(self.round_quantity(signal.symbol, qty_per_entry)),
-                        price=float(self.round_price(signal.symbol, entry_price)),
-                        timeInForce="GTC",
-                        workingType="CONTRACT_PRICE"
+                        type='limit',
+                        side=order_side,
+                        amount=qty_per_entry,
+                        price=self.round_price(signal.symbol, entry_price),
+                        params={'timeInForce': 'GTC'}
                     )
                     result['entry_orders'].append(order)
-                    logger.info(f"Placed entry order {i+1}: {order['orderId']}")
+                    logger.info(f"Placed entry order {i+1}: {order['id']}")
                     
-                    # Wait a bit and check if filled (simplified - in production use websocket)
-                    time.sleep(1)
-                    order_status = self.client.query_order(
-                        symbol=signal.symbol,
-                        orderId=order['orderId']
-                    )
-                    if order_status['status'] == 'FILLED':
-                        result['filled_quantity'] += Decimal(order_status['executedQty'])
+                    # Check if filled
+                    time.sleep(0.5)
+                    order_status = self.exchange.fetch_order(order['id'], signal.symbol)
+                    if order_status['status'] == 'closed':
+                        result['filled_quantity'] += Decimal(str(order_status['filled']))
                         
                 except Exception as e:
                     logger.error(f"Failed to place entry order {i+1}: {e}")
@@ -464,35 +502,34 @@ class BinanceTrader:
                 logger.error("Failed to place any entry orders")
                 return result
             
-            # Use actual filled quantity for SL/TP (or full quantity if not immediately filled)
-            actual_qty = result['filled_quantity'] if result['filled_quantity'] > 0 else quantity
+            # Use actual filled quantity or total for SL/TP
+            actual_qty = float(result['filled_quantity']) if result['filled_quantity'] > 0 else total_qty
             
-            # Place stop loss with actual quantity
-            sl_side = "SELL" if signal.side == OrderSide.LONG else "BUY"
+            # Place stop loss
+            sl_side = 'sell' if signal.side == OrderSide.LONG else 'buy'
             try:
-                sl_order = self.client.new_order(
+                sl_order = self.exchange.create_order(
                     symbol=signal.symbol,
+                    type='stop_market',
                     side=sl_side,
-                    type="STOP_MARKET",
-                    quantity=float(actual_qty),
-                    stopPrice=float(self.round_price(signal.symbol, signal.stop_loss)),
-                    workingType="CONTRACT_PRICE",
-                    priceProtect=True
+                    amount=actual_qty,
+                    stopPrice=self.round_price(signal.symbol, signal.stop_loss),
+                    params={'stopPrice': self.round_price(signal.symbol, signal.stop_loss)}
                 )
                 result['sl_order'] = sl_order
-                logger.info(f"Placed stop loss order: {sl_order['orderId']}")
+                logger.info(f"Placed stop loss order: {sl_order['id']}")
             except Exception as e:
                 logger.error(f"Failed to place stop loss: {e}")
                 # Cancel entry orders if SL fails
                 self._cancel_orders(signal.symbol, result['entry_orders'])
                 return result
             
-            # Place take profit orders with actual quantity
-            tp_side = "SELL" if signal.side == OrderSide.LONG else "BUY"
+            # Place take profit orders
+            tp_side = 'sell' if signal.side == OrderSide.LONG else 'buy'
             remaining_qty = actual_qty
             
             for i, (tp_price, tp_percent) in enumerate(signal.take_profits):
-                tp_qty = actual_qty * Decimal(tp_percent) / 100
+                tp_qty = actual_qty * (tp_percent / 100)
                 tp_qty = min(tp_qty, remaining_qty)
                 remaining_qty -= tp_qty
                 
@@ -500,18 +537,16 @@ class BinanceTrader:
                     break
                 
                 try:
-                    tp_order = self.client.new_order(
+                    tp_order = self.exchange.create_order(
                         symbol=signal.symbol,
+                        type='limit',
                         side=tp_side,
-                        type="LIMIT",
-                        quantity=float(self.round_quantity(signal.symbol, tp_qty)),
-                        price=float(self.round_price(signal.symbol, tp_price)),
-                        timeInForce="GTC",
-                        reduceOnly=True,
-                        workingType="CONTRACT_PRICE"
+                        amount=self.round_quantity(signal.symbol, Decimal(str(tp_qty))),
+                        price=self.round_price(signal.symbol, tp_price),
+                        params={'timeInForce': 'GTC', 'reduceOnly': True}
                     )
                     result['tp_orders'].append(tp_order)
-                    logger.info(f"Placed TP order {i+1}: {tp_order['orderId']}")
+                    logger.info(f"Placed TP order {i+1}: {tp_order['id']}")
                 except Exception as e:
                     logger.error(f"Failed to place TP {i+1}: {e}")
             
@@ -526,28 +561,31 @@ class BinanceTrader:
         """Cancel multiple orders"""
         for order in orders:
             try:
-                self.client.cancel_order(symbol=symbol, orderId=order['orderId'])
-                logger.info(f"Cancelled order {order['orderId']}")
+                self.exchange.cancel_order(order['id'], symbol)
+                logger.info(f"Cancelled order {order['id']}")
             except Exception as e:
-                logger.error(f"Failed to cancel order {order['orderId']}: {e}")
+                logger.error(f"Failed to cancel order {order['id']}: {e}")
     
-    def check_positions(self):
-        """Monitor and log current positions"""
+    def check_positions(self) -> List[dict]:
+        """Get and log current positions"""
         try:
-            account = self.client.account()
-            positions = [p for p in account['positions'] if Decimal(p['positionAmt']) != 0]
+            positions = self.get_open_positions()
             
             if positions:
                 logger.info(f"Current open positions: {len(positions)}")
                 for pos in positions:
-                    logger.info(f"  {pos['symbol']}: {pos['positionAmt']} @ {pos['entryPrice']} | PNL: {pos['unrealizedProfit']}")
+                    pnl = pos['unrealizedPnl'] if 'unrealizedPnl' in pos else 0
+                    logger.info(
+                        f"  {pos['symbol']}: {pos['contracts']} @ {pos['markPrice']} | "
+                        f"PNL: ${pnl:.2f}"
+                    )
             
             return positions
         except Exception as e:
             logger.error(f"Failed to check positions: {e}")
             return []
 
-# =================== SIGNAL PARSER (Same as before) ===================
+# =================== SIGNAL PARSER ===================
 
 class SignalParser:
     """Enhanced signal parser with validation"""
@@ -580,6 +618,12 @@ class SignalParser:
                 signal = cls._process_match(match, message_content)
                 if signal:
                     signal.message_id = message_id
+                    # Convert symbol format for CCXT (remove .P suffix, add / for spot symbols)
+                    signal.symbol = signal.symbol.replace('.P', '')
+                    # For futures, CCXT uses format like 'BTC/USDT:USDT'
+                    if not '/' in signal.symbol:
+                        base = signal.symbol.replace('USDT', '')
+                        signal.symbol = f"{base}/USDT:USDT"
                 return signal
         
         logger.debug(f"No pattern matched for message: {message_content[:100]}...")
@@ -649,7 +693,7 @@ class SignalParser:
             logger.error(f"Error processing match: {e}")
             return None
 
-# =================== ENHANCED DISCORD BOT ===================
+# =================== DISCORD BOT ===================
 
 class TradingBot(discord.Client):
     """Discord bot with concurrency control and persistence"""
@@ -676,11 +720,12 @@ class TradingBot(discord.Client):
         logger.info(f"Trading enabled: {ENABLE_TRADING}")
         logger.info(f"Testnet mode: {USE_TESTNET}")
         logger.info(f"Risk mode: {RISK_MODE}")
+        logger.info(f"Exchange: Binance (via CCXT)")
         
         # Show current balance
         balance = self.trader.get_account_balance()
         if balance:
-            logger.info(f"Account balance: ${balance}")
+            logger.info(f"Account balance: ${balance:.2f}")
         
         # Start background tasks
         asyncio.create_task(self.monitor_positions())
@@ -751,28 +796,31 @@ class TradingBot(discord.Client):
                     await message.reply("❌ Signal rejected: Position sizing or slippage check failed")
                     return
                 
-                # Execute trades with partial fill handling
-                result = self.trader.place_order_set_with_partial_handling(signal, quantity)
+                # Execute trades
+                result = self.trader.place_order_set(signal, quantity)
                 
                 if result['success']:
                     rr = signal.calculate_risk_reward()
                     
                     # Get account balance for context
                     balance = self.trader.get_account_balance()
-                    balance_str = f" | Balance: ${balance}" if balance else ""
+                    balance_str = f" | Balance: ${balance:.2f}" if balance else ""
+                    
+                    # Format symbol for display (remove :USDT suffix)
+                    display_symbol = signal.symbol.replace(':USDT', '')
                     
                     response = (
                         f"✅ **Signal Executed**\n"
-                        f"Symbol: {signal.symbol}\n"
+                        f"Symbol: {display_symbol}\n"
                         f"Side: {signal.side.name}\n"
-                        f"Quantity: {quantity}\n"
+                        f"Quantity: {quantity:.4f}\n"
                         f"Risk/Reward: {rr:.2f}\n"
                         f"Mode: {'LIVE' if ENABLE_TRADING else 'SIMULATION'}"
                         f"{balance_str}"
                     )
                     
                     if 'filled_quantity' in result and result['filled_quantity'] > 0:
-                        response += f"\nFilled: {result['filled_quantity']}/{quantity}"
+                        response += f"\nFilled: {result['filled_quantity']:.4f}/{quantity:.4f}"
                 else:
                     response = "❌ **Signal Failed**\nCheck logs for details"
                 
@@ -834,6 +882,14 @@ def validate_config():
             logger.error(f"Configuration error: {error}")
         return False
     
+    # Test CCXT installation
+    try:
+        import ccxt
+        logger.info(f"CCXT version: {ccxt.__version__}")
+    except ImportError:
+        logger.error("CCXT not installed. Run: pip install ccxt")
+        return False
+    
     # Warnings
     if not ENABLE_TRADING:
         logger.warning("TRADING IS DISABLED - Running in simulation mode")
@@ -846,7 +902,7 @@ def validate_config():
 def main():
     """Main entry point"""
     logger.info("=" * 50)
-    logger.info("Discord -> Binance Auto-Trading Bot v2.1")
+    logger.info("Discord -> Binance Auto-Trading Bot v3.0 (CCXT)")
     logger.info("=" * 50)
     
     if not validate_config():
